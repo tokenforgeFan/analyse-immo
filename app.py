@@ -14,6 +14,8 @@ import re
 import json
 import base64
 import threading
+import urllib.parse
+import urllib.request
 
 import pandas as pd
 from flask import Flask, request, render_template_string
@@ -29,6 +31,11 @@ try:
     from extracteur import fetch_playwright, DISPO as PLAYWRIGHT_DISPO
 except Exception:
     fetch_playwright, PLAYWRIGHT_DISPO = None, False
+
+try:
+    import loyers
+except Exception:
+    loyers = None
 
 app = Flask(__name__)
 _CACHE_DF = {}
@@ -206,13 +213,60 @@ def parser_html(url, html, source=""):
     return infos
 
 
+def commune_vers_cp(commune):
+    """Commune -> code postal via la Base Adresse Nationale (API publique)."""
+    try:
+        q = urllib.parse.urlencode({"q": commune.replace("-", " "),
+                                    "type": "municipality", "limit": 1})
+        with urllib.request.urlopen(BAN_URL + "?" + q, timeout=8) as r:
+            data = json.load(r)
+        return data["features"][0]["properties"]["postcode"]
+    except Exception:
+        return None
+
+
+def infos_depuis_url(url):
+    """Lit ce que l'URL revele deja : type de bien, commune, code postal.
+    Fonctionne sans charger la page (utile quand le site bloque la lecture)."""
+    infos = {}
+    u = url.lower()
+
+    # Type de bien
+    if re.search(r"/maison|-maison|vente-maison", u):
+        infos["type_local"] = "Maison"
+    elif re.search(r"/appartement|-appartement|vente-appartement", u):
+        infos["type_local"] = "Appartement"
+
+    # Code postal ecrit dans l'URL (frequent sur PAP)
+    m = re.search(r"[-/](\d{5})[-/]", u)
+    if m:
+        infos["code_postal"] = m.group(1)
+    else:
+        # Sinon : commune presente dans l'URL -> code postal via la BAN
+        m = re.search(r"/(?:vente|location)/([a-z0-9\-]+?)/(?:maison|appartement)", u)
+        if not m:
+            m = re.search(r"vente-(?:maison|appartement)-([a-z\-]+?)-\d{5}", u)
+        if m:
+            cp = commune_vers_cp(m.group(1))
+            if cp:
+                infos["code_postal"] = cp
+    return infos
+
+
 def extraire(url):
     html, source = recuperer_html(url)
-    return parser_html(url, html, source)
+    infos = parser_html(url, html, source)
+    # Complete avec ce que l'URL revele (sans dependre du chargement de la page)
+    for cle, val in infos_depuis_url(url).items():
+        infos.setdefault(cle, val)
+        if not infos.get(cle):
+            infos[cle] = val
+    return infos
 
 
 # ---- Donnees + graphique ---------------------------------------------------
 BASE_DUCKDB = "dvf.duckdb"
+BAN_URL = "https://api-adresse.data.gouv.fr/search/"
 
 try:
     import duckdb
@@ -306,6 +360,8 @@ PAGE = """
  .fill{height:100%;background:linear-gradient(90deg,#ef5350,#d29922,#3fb950);border-radius:5px}
  .scoredet{color:#8b949e;font-size:12px;margin-top:7px}
  .proj{margin-top:12px;font-size:15px}
+ .loc{margin-top:16px;padding-top:12px;border-top:1px solid #30363d}
+ .loctitle{color:#58a6ff;font-size:14px;font-weight:600}
  .footer{color:#586069;font-size:11px;line-height:1.5;margin-top:26px;
    border-top:1px solid #21262d;padding-top:12px}
 </style></head><body><div class=box>
@@ -313,8 +369,59 @@ PAGE = """
  <p class=sub>Colle l'URL d'une annonce Leboncoin, PAP ou Bien'ici, ou saisis directement les infos du bien.
    Donnees : DVF (ventes reelles).</p>
 
+ <form method=post action="/marche">
+   <label>Analyse de marche - code postal</label>
+   <div class=row>
+     <div><input name=cp placeholder="ex: 07700" value="{{ cp|default('') }}"></div>
+     <div><select name=type_local>
+       <option {% if type_sel=='Maison' %}selected{% endif %}>Maison</option>
+       <option {% if type_sel=='Appartement' %}selected{% endif %}>Appartement</option>
+     </select></div>
+   </div>
+   <button type=submit>Voir le marche</button>
+ </form>
+
+ {% if mar %}
+ <div class=card>
+   {% if not mar.ok %}
+     <p style="color:#ef5350">{{ mar.raison }}</p>
+   {% else %}
+   <div class=scoretop>
+     <span><b>{{ mar.type_local }}s - {{ mar.cp }}</b></span>
+     <span class=scoreval>{{ mar.score }}/100</span>
+   </div>
+   <div class=bar><div class=fill style="width:{{ mar.score }}%"></div></div>
+   <div class=scoredet>{{ mar.score_libelle }} - {{ mar.n }} ventes ({{ mar.mode }})
+     {% if mar.taux is not none %} - tendance {{ '%+.1f'|format(mar.taux*100) }} %/an{% endif %}</div>
+   <table>
+     <tr><td class=k>Prix/m2 median</td><td class=v>{{ e(mar.pm2) }}/m2</td></tr>
+     <tr><td class=k>Fourchette courante</td><td class=v>{{ e(mar.q1) }} - {{ e(mar.q3) }}/m2</td></tr>
+     <tr><td class=k>Bien type ({{ mar.surface_mediane|int }} m2)</td><td class=v>{{ e(mar.prix_median) }}</td></tr>
+     {% if mar.projection_pm2 %}
+     <tr><td class=k>Prix/m2 projete a 12 mois</td><td class=v>{{ e(mar.projection_pm2) }}/m2</td></tr>
+     {% endif %}
+   </table>
+
+   {% if mar.loyer_m2 %}
+   <div class=loc>
+     <div class=loctitle>Marche locatif</div>
+     <table>
+       <tr><td class=k>Loyer indicatif (charges comprises)</td><td class=v>{{ '%.2f'|format(mar.loyer_m2) }} EUR/m2/mois</td></tr>
+       <tr><td class=k>Loyer d'un bien de {{ mar.surface_mediane|int }} m2</td><td class=v>{{ e(mar.loyer_mensuel) }}/mois</td></tr>
+       <tr><td class=k><b>Rendement locatif brut</b></td><td class=v>{{ '%.2f'|format(mar.rendement) }} %</td></tr>
+     </table>
+     <div class=scoredet>Loyers d'annonces modelises (instantane annuel), hors charges
+       de propriete, vacance et fiscalite : le rendement net est sensiblement inferieur.</div>
+   </div>
+   {% endif %}
+
+   {% if mar.chart %}<img src="data:image/png;base64,{{ mar.chart }}">{% endif %}
+   {% endif %}
+ </div>
+ {% endif %}
+
  <form method=post action="/">
-   <label>URL de l'annonce</label>
+   <label>Analyser une annonce precise (URL ou saisie manuelle)</label>
    <input name=url placeholder="https://www.bienici.com/annonce/..." value="{{ url|default('') }}">
    <button type=submit>Analyser</button>
  </form>
@@ -415,7 +522,8 @@ PAGE = """
  {% endif %}
  <p class=footer>Estimations statistiques issues des donnees DVF (DGFiP, open data), agregees
    et anonymisees - aucune transaction individuelle n'est publiee. Valeur indicative,
-   sans portee contractuelle : ne remplace pas l'avis d'un professionnel.</p>
+   sans portee contractuelle : ne remplace pas l'avis d'un professionnel.<br>
+   Loyers : Estimations ANIL, a partir des donnees du Groupe SeLoger et de leboncoin.</p>
 </div></body></html>
 """
 
@@ -426,6 +534,47 @@ def _options_list():
         montant = (f"+{val:,} EUR".replace(",", " ") if typ == "eur" else f"{val:+.0%}")
         out.append((k, label, montant))
     return out
+
+
+def code_insee_depuis_cp(cp):
+    """Code INSEE de la commune principale d'un code postal (via la BAN)."""
+    try:
+        q = urllib.parse.urlencode({"q": str(cp), "type": "municipality", "limit": 1})
+        with urllib.request.urlopen(BAN_URL + "?" + q, timeout=8) as r:
+            data = json.load(r)
+        return data["features"][0]["properties"]["citycode"]
+    except Exception:
+        return None
+
+
+@app.route("/marche", methods=["POST"])
+def marche():
+    cp = request.form.get("cp", "").strip()
+    type_local = request.form.get("type_local", "Maison")
+    ctx = {"e": A.euros, "playwright": PLAYWRIGHT_DISPO, "options_list": _options_list(),
+           "cp": cp, "type_sel": type_local}
+    if not re.fullmatch(r"\d{5}", cp):
+        ctx["mar"] = {"ok": False, "raison": "Code postal invalide (5 chiffres attendus)."}
+        return render_template_string(PAGE, **ctx)
+
+    df = get_df(cp)
+    if df is None:
+        ctx["mar"] = {"ok": False, "raison": "Donnees DVF indisponibles pour ce departement."}
+        return render_template_string(PAGE, **ctx)
+
+    mar = A.analyse_marche(df, cp, type_local)
+    if mar.get("ok"):
+        # Volet locatif (Carte des loyers ANIL)
+        if loyers is not None:
+            insee = code_insee_depuis_cp(cp)
+            lm2 = loyers.loyer_m2(insee, type_local) if insee else None
+            if lm2:
+                mar["loyer_m2"] = lm2
+                mar["loyer_mensuel"] = lm2 * mar["surface_mediane"]
+                mar["rendement"] = lm2 * 12 / mar["pm2"] * 100
+        mar["chart"] = chart_base64(mar)
+    ctx["mar"] = mar
+    return render_template_string(PAGE, **ctx)
 
 
 @app.route("/robots.txt")
