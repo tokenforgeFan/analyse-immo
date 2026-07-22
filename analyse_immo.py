@@ -242,6 +242,38 @@ def score_marche(taux, n_ventes_an, dispersion):
     return round(note), libelle
 
 
+def analyse_marche(df, cp, type_local, centre=None):
+    """Analyse du MARCHE d'une zone, sans bien precis : prix/m2, tendance,
+    score, volume. Sert de base a l'analyse par code postal."""
+    pool, mode = pool_zone(df, cp, type_local, centre)
+    if len(pool) < 5:
+        return {"ok": False, "raison": f"Trop peu de ventes ({len(pool)}) sur cette zone."}
+
+    serie, taux = tendance(pool)
+    limite = pd.Timestamp.today() - pd.DateOffset(months=MOIS_COMPARABLES)
+    recents = pool[pool["date_mutation"] >= limite]
+    base = recents if len(recents) >= 5 else pool
+
+    pm2 = float(base["prix_m2"].median())
+    q1, q3 = float(base["prix_m2"].quantile(.25)), float(base["prix_m2"].quantile(.75))
+    dispersion = (q3 - q1) / pm2 if pm2 else 0
+    serie_list = ([] if serie is None else
+                  [(int(a), float(r["med"]), int(r["nb"])) for a, r in serie.iterrows()])
+    ventes_an = (sum(nb for _, _, nb in serie_list) / len(serie_list)) if serie_list else 0
+    note, libelle = score_marche(taux, ventes_an, dispersion)
+
+    surf_med = float(base["surface_reelle_bati"].median())
+    return {"ok": True, "mode": mode, "cp": cp, "type_local": type_local,
+            "n": len(base), "pm2": pm2, "q1": q1, "q3": q3,
+            "surface_mediane": surf_med,
+            "prix_median": pm2 * surf_med,
+            "serie": serie_list, "taux": taux,
+            "score": note, "score_libelle": libelle,
+            "ventes_an": ventes_an, "dispersion": dispersion,
+            "projection_pm2": pm2 * (1 + taux) if taux is not None else None,
+            "pool": pool}
+
+
 def analyser_bien(df, cp, type_local, surface, prix, options="", centre=None,
                   terr_nc=0.0, terr_c=0.0):
     """Version reutilisable (web/API) : renvoie un dict complet. Meme logique
