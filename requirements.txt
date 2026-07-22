@@ -1,0 +1,9 @@
+flask
+waitress
+pandas
+numpy
+matplotlib
+duckdb
+requests
+beautifulsoup4
+python-dateutil
