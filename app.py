@@ -310,8 +310,8 @@ PAGE = """
    border-top:1px solid #21262d;padding-top:12px}
 </style></head><body><div class=box>
  <h1>Analyseur d'annonce immobiliere</h1>
- <p class=sub>Colle l'URL d'une annonce Leboncoin, PAP ou Bien'ici. Donnees : DVF (ventes reelles).
-   {% if not playwright %}<span class=warn>[extraction auto limitee : installe Playwright]</span>{% endif %}</p>
+ <p class=sub>Colle l'URL d'une annonce Leboncoin, PAP ou Bien'ici, ou saisis directement les infos du bien.
+   Donnees : DVF (ventes reelles).</p>
 
  <form method=post action="/">
    <label>URL de l'annonce</label>
@@ -442,8 +442,8 @@ def accueil():
         ctx["url"] = url
         infos = extraire(url) if url else {"url": url}
         if url and not (infos.get("prix") or infos.get("surface") or infos.get("code_postal")):
-            infos.setdefault("note", "Lecture automatique impossible (site protege ?). "
-                                     "Remplis les champs a la main.")
+            infos.setdefault("note", "l'annonce n'a pas pu etre lue automatiquement - "
+                                     "complete les champs ci-dessous")
         ctx["form"] = infos
     return render_template_string(PAGE, **ctx)
 
